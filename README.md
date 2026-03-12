@@ -4,6 +4,9 @@ Training-free framework that converts SAM3 into a real-time multi-class
 open-vocabulary detector. Achieves **55.8 AP** on COCO val2017 (80 classes)
 at **15.8 FPS** (4 classes, 1008px) on a single RTX 4080.
 
+Distilled student backbones and pre-built weights are available on
+[HuggingFace](https://huggingface.co/mehmetkeremturkcan/DART).
+
 ## Table of Contents
 
 - [Installation](#installation)
@@ -28,7 +31,7 @@ at **15.8 FPS** (4 classes, 1008px) on a single RTX 4080.
 
 ## Installation
 
-Tested on Windows 11 and Ubuntu, RTX 4080 16 GB. All commands use bash syntax.
+Tested on Windows 11, RTX 4080 16 GB. All commands use bash syntax.
 
 | Package | Version |
 |---------|---------|
@@ -57,6 +60,7 @@ pip install pycocotools-windows   # Windows
 | File | Description | How to get |
 |------|-------------|------------|
 | `sam3.pt` | SAM3 checkpoint | Auto-downloads from HuggingFace on first run |
+| Student weights | Distilled backbones (RepViT, TinyViT, EfficientViT) | [HuggingFace](https://huggingface.co/mehmetkeremturkcan/DART) |
 | `x.jpg` | Test image | Any image |
 | `input.mp4` | Test video | Any video |
 | `train2017/` | Calibration images | [COCO](https://cocodataset.org) (only for pruning search) |
