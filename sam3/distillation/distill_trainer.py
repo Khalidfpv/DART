@@ -62,6 +62,18 @@ def reduce_scalar(value: float, device: torch.device) -> float:
     return t.item() / get_world_size()
 
 
+def _log_vram(label: str = ""):
+    """Log current GPU VRAM usage (rank 0 only)."""
+    if not torch.cuda.is_available():
+        return
+    alloc = torch.cuda.memory_allocated() / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    prefix = f"  [{label}] " if label else "  "
+    if is_main_process():
+        print(f"{prefix}VRAM: {alloc:.1f}GB allocated, {reserved:.1f}GB reserved, {total:.0f}GB total")
+
+
 def setup_distributed():
     """Initialize distributed process group.
 
@@ -328,6 +340,7 @@ class DistillationTrainer:
         )
         dist_print(f"Epochs: {num_epochs}, Steps/epoch: {len(self.dataloader)}")
         dist_print(f"Total steps: {total_steps}")
+        _log_vram("After model setup")
 
     @torch.no_grad()
     def _get_teacher_features(self, images: torch.Tensor) -> list:
@@ -377,6 +390,9 @@ class DistillationTrainer:
             total_loss += loss.item()
             num_steps += 1
 
+            if step == 0 and epoch == 0:
+                _log_vram("After first step")
+
             if (step + 1) % self.log_every == 0 and is_main_process():
                 avg = total_loss / num_steps
                 lr = self.scheduler.get_last_lr()[0]
@@ -403,15 +419,16 @@ class DistillationTrainer:
         for name, param in self._student_unwrapped.named_parameters():
             if param.requires_grad:
                 adapter_state[name] = param.data.cpu()
-        torch.save(
-            {
-                "epoch": epoch + 1,
-                "loss": loss,
-                "adapter_state_dict": adapter_state,
-                "student_state_dict": self._student_unwrapped.state_dict(),
-            },
-            path,
-        )
+        ckpt = {
+            "epoch": epoch + 1,
+            "loss": loss,
+            "adapter_state_dict": adapter_state,
+            "student_state_dict": self._student_unwrapped.state_dict(),
+        }
+        # Record teacher mask-blocks so inference can replay them
+        if hasattr(self, "mask_blocks_str") and self.mask_blocks_str:
+            ckpt["mask_blocks"] = self.mask_blocks_str
+        torch.save(ckpt, path)
         print(f"  Saved checkpoint: {path}")
 
     def train(self):

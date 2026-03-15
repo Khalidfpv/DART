@@ -365,6 +365,7 @@ python demo_video.py --video input.mp4 --classes car person \
 
 | Model | Backbone Params | COCO AP | Backbone Latency |
 |-------|----------------|---------|------------------|
+| ViT-H Pruned-16 | 220M | 53.6 | 26.6 ms |
 | RepViT-M2.3 | 8.2M | 38.7 | 13.9 ms |
 | TinyViT-21M | 21M | 30.1 | 12.2 ms |
 | EfficientViT-L2 | 9.2M | 21.7 | 10.7 ms |
@@ -408,12 +409,27 @@ Available checkpoints in `stage1_all_converted/`:
 
 ## Block Pruning
 
-Training-free sub-block pruning removes redundant attention/MLP sub-blocks from
-the ViT-H backbone. Each of the 32 blocks decomposes into two candidates
-(attention + MLP), yielding 64 total. Global attention blocks (7, 15, 23, 31)
-are protected.
+Two pruning granularities are supported: sub-block masking (skip individual
+attention or MLP within a block) and full block removal (skip entire blocks).
+Full block removal gives much better speed gains because TRT can eliminate the
+blocks entirely from the engine.
 
-### Calibrate pruning order
+### Analyze block importance
+
+Measures each block's contribution by removing it and computing feature
+reconstruction loss on calibration images:
+
+```bash
+python scripts/analyze_block_importance.py \
+    --checkpoint sam3.pt --calib-dir train2017 \
+    --num-images 20 --num-greedy 16 --imgsz 1008
+```
+
+Phase 1 ranks blocks individually. Phase 2 runs a greedy search that
+iteratively removes the least-important block and reports cumulative loss,
+cosine similarity, and estimated speedup.
+
+### Sub-block pruning search
 
 ```bash
 python scripts/block_pruner_search.py \
@@ -421,18 +437,69 @@ python scripts/block_pruner_search.py \
     --num-images 16 --num-prune 16 --imgsz 1008
 ```
 
+### Self-distillation for pruned backbone
+
+After identifying blocks to remove, self-distillation recovers quality by
+training the remaining blocks against the full backbone:
+
+```bash
+# Single GPU
+python scripts/distill.py \
+    --data-dir /path/to/coco/train2017 \
+    --checkpoint sam3.pt \
+    --phase prune \
+    --skip-blocks "5,10,12,14,17,18,19,20,21,22,24,25,26,27,28,30" \
+    --epochs 100 --batch-size 4 --lr 1e-4 \
+    --output-dir skipblocks_distill
+
+# 8xH100 via SLURM
+srun --ntasks=1 torchrun --nproc_per_node=8 scripts/distill.py \
+    --data-dir /path/to/coco/train2017 \
+    --checkpoint sam3.pt \
+    --phase prune \
+    --skip-blocks "5,10,12,14,17,18,19,20,21,22,24,25,26,27,28,30" \
+    --epochs 100 --batch-size 32 --lr 1e-4 \
+    --output-dir skipblocks_distill
+```
+
+### Export pruned backbone to TRT
+
+Use the HF export path for fused attention kernels:
+
+```bash
+PYTHONIOENCODING=utf-8 python scripts/export_hf_backbone.py \
+    --image x.jpg \
+    --output-onnx onnx_hf_backbone_1008_pruned/hf_backbone.onnx \
+    --output-engine hf_backbone_1008_pruned_fp16.engine \
+    --skip-blocks "5,10,12,14,17,18,19,20,21,22,24,25,26,27,28,30"
+```
+
+### Evaluate pruned backbone
+
+```bash
+PYTHONIOENCODING=utf-8 python scripts/eval_coco_official.py \
+    --images-dir D:/val2017 \
+    --ann-file D:/coco2017labels/coco/annotations/instances_val2017.json \
+    --checkpoint sam3.pt \
+    --pruned-checkpoint distilled/pruned_16blocks.pt \
+    --configs "pruned16_1008=trt:hf_backbone_1008_pruned_fp16.engine;encdec:enc_dec_1008_c16_presence_fp16.engine;imgsz:1008"
+```
+
 ### Recommended configs
 
 ```bash
-# Prune 8 (recommended — minimal quality loss)
+# Full block removal, 16 blocks (1.8x backbone speedup, -2.2 AP)
+--skip-blocks "5,10,12,14,17,18,19,20,21,22,24,25,26,27,28,30"
+
+# Sub-block masking, 8 sub-blocks (minimal quality loss)
 --mask-blocks "25:attn,28:mlp,27:attn,22:attn,28:attn,30:mlp,20:attn,27:mlp"
 
-# Prune 16 (faster, -15% AP)
+# Sub-block masking, 16 sub-blocks
 --mask-blocks "25:attn,28:mlp,27:attn,22:attn,28:attn,30:mlp,20:attn,27:mlp,26:attn,22:mlp,24:attn,18:attn,20:mlp,21:attn,25:mlp,18:mlp"
 ```
 
-The `--mask-blocks` flag must match between export (`export_hf_backbone.py`)
-and inference (`demo_multiclass.py` / `demo_video.py`).
+The `--skip-blocks` or `--mask-blocks` flag must match between export
+(`export_hf_backbone.py`) and inference (`demo_multiclass.py` / `demo_video.py`).
 
 ---
 
@@ -527,6 +594,7 @@ class counts exceed 30 FPS.
 | EfficientViT-L2 | 10.6 | 62.5 | 21.7 |
 | TinyViT-21M | 12.0 | 57.8 | 30.1 |
 | RepViT-M2.3 | 13.6 | 55.8 | 38.7 |
+| ViT-H Pruned-16 | 26.6 | 37.6 | 53.6 |
 
 ### Reproduce benchmarks
 
@@ -630,6 +698,7 @@ python scripts/bisect_blocks_fp32.py --onnx backbone.onnx --checkpoint sam3.pt
 |--------|-------------|
 | `scripts/distill.py` | Train student backbone adapters |
 | `scripts/block_pruner_search.py` | Calibrate sub-block pruning order |
+| `scripts/analyze_block_importance.py` | Analyze full block importance and greedy removal |
 
 ---
 

@@ -214,6 +214,30 @@ def _apply_mask_blocks(vision_encoder, mask_blocks):
     return count
 
 
+def _apply_skip_blocks(vision_encoder, skip_blocks):
+    """Replace skipped layers with identity functions.
+
+    Args:
+        vision_encoder: HF Sam3VisionEncoder
+        skip_blocks: set of block indices to skip entirely
+    """
+    layers = vision_encoder.backbone.layers
+    count = 0
+    for idx in skip_blocks:
+        if idx >= len(layers):
+            print(f"  WARNING: block {idx} out of range (model has {len(layers)} layers)")
+            continue
+
+        def _identity_forward(self_unused, hidden_states, **kwargs):
+            return hidden_states
+
+        layers[idx].forward = types.MethodType(_identity_forward, layers[idx])
+        count += 1
+
+    print(f"  Skipped {count} full blocks: {sorted(skip_blocks)}")
+    return count
+
+
 def export_split_onnx(output_dir, split_block, imgsz=1008, mask_blocks=None):
     """Export HF SAM3 backbone as two ONNX models (Part1 + Part2) via dynamo."""
     from transformers.models.sam3 import Sam3Model
@@ -300,7 +324,7 @@ def export_split_onnx(output_dir, split_block, imgsz=1008, mask_blocks=None):
     return onnx_part1, onnx_part2
 
 
-def export_onnx(output_dir, imgsz=1008, mask_blocks=None):
+def export_onnx(output_dir, imgsz=1008, mask_blocks=None, skip_blocks=None):
     """Export HF SAM3 backbone to ONNX via dynamo."""
     from transformers.models.sam3 import Sam3Model
 
@@ -333,6 +357,11 @@ def export_onnx(output_dir, imgsz=1008, mask_blocks=None):
     if mask_blocks:
         print(f"Applying mask_blocks ({len(mask_blocks)} blocks)...")
         _apply_mask_blocks(model.vision_encoder, mask_blocks)
+
+    # Apply full block skips before export
+    if skip_blocks:
+        print(f"Applying skip_blocks ({len(skip_blocks)} blocks)...")
+        _apply_skip_blocks(model.vision_encoder, skip_blocks)
 
     # Extract vision encoder and wrap it
     wrapper = HFBackboneForExport(model.vision_encoder).cpu().eval()
@@ -427,7 +456,7 @@ def build_engine(onnx_path: str, output_path: str):
     return output_path
 
 
-def run_pytorch_reference(image_path, imgsz=1008, mask_blocks=None):
+def run_pytorch_reference(image_path, imgsz=1008, mask_blocks=None, skip_blocks=None):
     """Run HF SAM3 vision encoder in PyTorch, return FPN outputs + pixel_values."""
     from transformers.models.sam3 import Sam3Processor, Sam3Model
     from PIL import Image
@@ -455,6 +484,10 @@ def run_pytorch_reference(image_path, imgsz=1008, mask_blocks=None):
     # Apply same mask_blocks as the export for fair comparison
     if mask_blocks:
         _apply_mask_blocks(model.vision_encoder, mask_blocks)
+
+    # Apply same skip_blocks as the export
+    if skip_blocks:
+        _apply_skip_blocks(model.vision_encoder, skip_blocks)
 
     image = Image.open(image_path).convert("RGB")
     inputs = processor(images=image, text="dummy", return_tensors="pt").to("cuda")
@@ -610,6 +643,10 @@ def main():
              "Part1 (embeddings + blocks[0:K]) and Part2 (blocks[K:] + FPN). "
              "Use with --output-engine to set Part1 engine name (Part2 gets _part2 suffix).",
     )
+    parser.add_argument(
+        "--skip-blocks", type=str, default=None,
+        help="Comma-separated block indices to skip entirely, e.g. '5,10,12,14'",
+    )
     args = parser.parse_args()
 
     # Validate imgsz
@@ -627,6 +664,12 @@ def main():
         print(f"Block masking: {len(mask_blocks)} blocks")
         for idx in sorted(mask_blocks):
             print(f"  block {idx}: mask {mask_blocks[idx]}")
+
+    # Parse skip_blocks
+    skip_blocks = None
+    if args.skip_blocks:
+        skip_blocks = set(int(x.strip()) for x in args.skip_blocks.split(","))
+        print(f"Block skipping: {len(skip_blocks)} blocks: {sorted(skip_blocks)}")
 
     # --- Split export mode ---
     if args.split_block is not None:
@@ -697,7 +740,7 @@ def main():
     # Step 1: Export ONNX
     if not args.skip_export:
         onnx_path = export_onnx(onnx_dir, imgsz=args.imgsz,
-                                mask_blocks=mask_blocks)
+                                mask_blocks=mask_blocks, skip_blocks=skip_blocks)
     else:
         print(f"Skipping ONNX export, using: {onnx_path}")
 
@@ -709,7 +752,8 @@ def main():
 
     # Step 3: PyTorch reference
     pixel_values, ref_fpn, pytorch_ms = run_pytorch_reference(
-        args.image, imgsz=args.imgsz, mask_blocks=mask_blocks
+        args.image, imgsz=args.imgsz, mask_blocks=mask_blocks,
+        skip_blocks=skip_blocks,
     )
 
     # Step 4: TRT inference

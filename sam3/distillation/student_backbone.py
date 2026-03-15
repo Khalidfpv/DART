@@ -70,6 +70,7 @@ class StudentBackbone(nn.Module):
         student_indices: Tuple[int, ...] = (0, 1, 2),
         target_sizes: Optional[List[Tuple[int, int]]] = None,
         freeze_backbone: bool = True,
+        img_size: Optional[int] = None,
     ):
         super().__init__()
 
@@ -84,11 +85,15 @@ class StudentBackbone(nn.Module):
         self.target_sizes = target_sizes
 
         # Create backbone from timm
+        extra_kwargs = {}
+        if img_size is not None:
+            extra_kwargs["img_size"] = img_size
         self.backbone = timm.create_model(
             backbone_name,
             pretrained=pretrained,
             features_only=True,
             out_indices=list(student_indices),
+            **extra_kwargs,
         )
 
         if freeze_backbone:
@@ -197,6 +202,19 @@ BACKBONE_CONFIGS = {
         "backbone_name": "tiny_vit_21m_224.dist_in22k_ft_in1k",
         "student_indices": (0, 1, 2),
     },
+    "vit_base": {
+        "backbone_name": "vit_base_patch16_224.augreg2_in21k_ft_in1k",
+        "student_indices": (0, 1, 2),
+        "img_size": 1008,
+        # ViT-B/16: 86M params, 768-dim features at single scale
+        # Requires img_size since ViT patch embed has strict size check
+    },
+    "vit_base_dinov3": {
+        "backbone_name": "vit_base_patch16_dinov3.lvd1689m",
+        "student_indices": (0, 1, 2),
+        "img_size": 1008,
+        # DINOv3 ViT-B/16: strong self-supervised features, 768-dim
+    },
 }
 
 
@@ -227,4 +245,5 @@ def build_student_backbone(
         pretrained=pretrained,
         student_indices=cfg["student_indices"],
         freeze_backbone=freeze_backbone,
+        img_size=cfg.get("img_size"),
     )

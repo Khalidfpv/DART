@@ -463,3 +463,99 @@ class TRTSplitBackbone:
         for attr in ("_ctx1", "_ctx2", "_engine1", "_engine2"):
             if hasattr(self, attr):
                 delattr(self, attr)
+
+
+class TRTTrunk:
+    """TensorRT replacement for the ViT trunk only (no FPN neck).
+
+    Produces the raw trunk feature map that feeds into both SAM3 and SAM2
+    FPN branches.  Used by the native video tracker where both branches
+    need the same trunk output.
+
+    The engine should be exported with ``--trunk-only`` flag in
+    ``export_backbone.py``.
+
+    Args:
+        engine_path: Path to serialized TRT engine (trunk-only).
+        device: CUDA device string.
+    """
+
+    def __init__(self, engine_path: str, device: str = "cuda"):
+        if trt is None:
+            raise ImportError("tensorrt is required")
+
+        self.device = torch.device(device)
+
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+        with open(engine_path, "rb") as f:
+            self.engine = runtime.deserialize_cuda_engine(f.read())
+        self.context = self.engine.create_execution_context()
+
+        _trt_to_torch = {
+            trt.float32: torch.float32,
+            trt.float16: torch.float16,
+            trt.int32: torch.int32,
+        }
+        if hasattr(trt, "bfloat16"):
+            _trt_to_torch[trt.bfloat16] = torch.bfloat16
+
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            shape = tuple(self.engine.get_tensor_shape(name))
+            dtype = _trt_to_torch.get(
+                self.engine.get_tensor_dtype(name), torch.float32
+            )
+            mode = self.engine.get_tensor_mode(name)
+
+            if mode == trt.TensorIOMode.INPUT:
+                self._input_name = name
+                self._input_buf = torch.empty(
+                    shape, dtype=dtype, device=self.device
+                )
+            else:
+                self._output_name = name
+                self._output_buf = torch.empty(
+                    shape, dtype=dtype, device=self.device
+                )
+
+        self.context.set_tensor_address(
+            self._input_name, self._input_buf.data_ptr()
+        )
+        self.context.set_tensor_address(
+            self._output_name, self._output_buf.data_ptr()
+        )
+
+        self._stream = torch.cuda.Stream(device=self.device)
+
+        print(
+            f"TRT trunk loaded: {engine_path}\n"
+            f"  Input:  {self._input_name} {list(self._input_buf.shape)} {self._input_buf.dtype}\n"
+            f"  Output: {self._output_name} {list(self._output_buf.shape)} {self._output_buf.dtype}"
+        )
+
+    def __call__(self, x: Tensor) -> List[Tensor]:
+        """Run TRT trunk inference.
+
+        Args:
+            x: Input image tensor (B, 3, H, W) on CUDA.
+
+        Returns:
+            List with single trunk feature map [Tensor(B, C, H', W')],
+            matching the ViT trunk's output format.
+        """
+        self._input_buf.copy_(x)
+
+        event = torch.cuda.current_stream(self.device).record_event()
+        self._stream.wait_event(event)
+        self.context.execute_async_v3(self._stream.cuda_stream)
+        done = self._stream.record_event()
+        torch.cuda.current_stream(self.device).wait_event(done)
+
+        return [self._output_buf.float()]
+
+    def __del__(self):
+        if hasattr(self, "context"):
+            del self.context
+        if hasattr(self, "engine"):
+            del self.engine

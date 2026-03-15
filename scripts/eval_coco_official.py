@@ -73,7 +73,7 @@ def parse_config(config_str: str) -> Dict:
     """Parse config string into a dict."""
     result = {
         "name": None, "trt": None, "encdec": None,
-        "mask_blocks": None, "imgsz": None,
+        "mask_blocks": None, "skip_blocks": None, "imgsz": None,
     }
 
     if "=" in config_str:
@@ -86,6 +86,8 @@ def parse_config(config_str: str) -> Dict:
                 result["encdec"] = part[7:]
             elif part.startswith("mask:"):
                 result["mask_blocks"] = part[5:]
+            elif part.startswith("skip:"):
+                result["skip_blocks"] = part[5:]
             elif part.startswith("imgsz:"):
                 result["imgsz"] = int(part[6:])
             elif part == "pytorch":
@@ -149,14 +151,22 @@ def evaluate_config(
     trt_engine = config["trt"]
     encdec = config["encdec"] or default_encdec
     mask_str = config["mask_blocks"]
+    skip_str = config.get("skip_blocks")
     imgsz = config["imgsz"] or default_imgsz
 
     # Apply pruning mask to backbone trunk (skip for student/efficient models)
     trunk = getattr(getattr(model.backbone, 'vision_backbone', None), 'trunk', None)
     if trunk is not None and hasattr(trunk, 'blocks'):
         n_masked = apply_mask_config(trunk, mask_str)
+        # Apply full block skips
+        if skip_str:
+            skip_set = set(int(x.strip()) for x in skip_str.split(","))
+            trunk.skip_blocks = skip_set
+        else:
+            trunk.skip_blocks = set()
     else:
         n_masked = 0
+        skip_set = set()
 
     is_trt = trt_engine is not None
 
@@ -167,6 +177,8 @@ def evaluate_config(
     print(f"  Compile:   {compile_mode or 'disabled'}")
     print(f"  Resolution: {imgsz}")
     print(f"  Masked:    {n_masked} sub-blocks")
+    if skip_str:
+        print(f"  Skipped:   {len(skip_set)} full blocks: {sorted(skip_set)}")
     print(f"  FP16:      {use_fp16}")
     print(f"  Presence:  {'disabled (detection_only)' if detection_only else 'enabled'}")
     print(f"  NMS:       disabled (official mode)")
@@ -389,6 +401,11 @@ def main():
         "--efficient-model", type=str, default=None,
         help="Backbone variant (e.g. b0/b1/b2, m0_9/m1_1/m2_3, 5m/11m/21m)",
     )
+    parser.add_argument(
+        "--pruned-checkpoint", type=str, default=None,
+        help="Path to pruned backbone checkpoint from prune_trainer (.pt). "
+             "Loads fine-tuned weights and auto-applies skip_blocks.",
+    )
     args = parser.parse_args()
 
     # Load COCO annotations
@@ -455,6 +472,20 @@ def main():
             device=args.device,
             eval_mode=True,
         )
+
+    # Load pruned backbone weights if specified
+    if args.pruned_checkpoint:
+        print(f"\nLoading pruned backbone from {args.pruned_checkpoint} ...")
+        ckpt = torch.load(args.pruned_checkpoint, map_location=args.device, weights_only=True)
+        state = ckpt.get("pruned_state_dict", ckpt)
+        vision_bb = model.backbone.vision_backbone
+        missing, unexpected = vision_bb.load_state_dict(state, strict=False)
+        print(f"  Loaded: {len(state)} keys, "
+              f"{len(missing)} missing (pruned), {len(unexpected)} unexpected")
+        if "skip_blocks" in ckpt and ckpt["skip_blocks"]:
+            skip_set = set(ckpt["skip_blocks"])
+            vision_bb.trunk.skip_blocks = skip_set
+            print(f"  Auto-set skip_blocks: {sorted(skip_set)}")
 
     # Evaluate each config
     all_results = []

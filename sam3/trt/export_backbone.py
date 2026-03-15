@@ -51,6 +51,23 @@ class _BackboneForExport(nn.Module):
         return fpn[0], fpn[1], fpn[2]
 
 
+class _TrunkForExport(nn.Module):
+    """Thin wrapper that exports only the ViT trunk (no FPN neck).
+
+    Produces a single feature map output — the raw ViT output before FPN
+    convolutions.  This is used by the native video tracker where both
+    SAM3 and SAM2 FPN branches need the same trunk output.
+    """
+
+    def __init__(self, backbone):
+        super().__init__()
+        self.trunk = backbone.vision_backbone.trunk
+
+    def forward(self, images: torch.Tensor):
+        outputs = self.trunk(images)
+        return outputs[-1]  # (B, C, H, W) — last feature map
+
+
 def _export_torchscript(export_module, dummy, output_path, opset_version, output_names):
     """Export via classic TorchScript tracing (original path)."""
     print(f"Exporting to ONNX via TorchScript (opset {opset_version}) -> {output_path} ...")
@@ -151,6 +168,8 @@ def export_onnx(
     opset_version: int = 17,
     validate: bool = True,
     use_dynamo: bool = False,
+    skip_blocks: str = None,
+    pruned_checkpoint: str = None,
 ):
     """Export the SAM3 backbone to ONNX with real-valued RoPE."""
     from sam3.model_builder import build_sam3_image_model
@@ -165,6 +184,29 @@ def export_onnx(
         enable_segmentation=False,  # not needed for backbone export
     )
     backbone = model.backbone
+
+    # Apply block skipping
+    if skip_blocks:
+        skip_set = set(int(x.strip()) for x in skip_blocks.split(","))
+        trunk = backbone.vision_backbone.trunk
+        trunk.skip_blocks = skip_set
+        print(f"Skipping {len(skip_set)} blocks: {sorted(skip_set)}")
+
+    # Load pruned checkpoint weights (from prune_trainer self-distillation)
+    if pruned_checkpoint:
+        print(f"Loading pruned weights from {pruned_checkpoint} ...")
+        ckpt = torch.load(pruned_checkpoint, map_location="cuda", weights_only=True)
+        state = ckpt.get("pruned_state_dict", ckpt)
+        # The pruned checkpoint contains vision_backbone state_dict keys
+        vision_bb = backbone.vision_backbone
+        missing, unexpected = vision_bb.load_state_dict(state, strict=False)
+        print(f"  Loaded: {len(state)} keys, "
+              f"{len(missing)} missing (pruned), {len(unexpected)} unexpected")
+        # Auto-apply skip_blocks from checkpoint metadata if not specified
+        if not skip_blocks and "skip_blocks" in ckpt and ckpt["skip_blocks"]:
+            skip_set = set(ckpt["skip_blocks"])
+            vision_bb.trunk.skip_blocks = skip_set
+            print(f"  Auto-set skip_blocks from checkpoint: {sorted(skip_set)}")
 
     # Patch RoPE for ONNX compatibility (needed for both TorchScript and dynamo)
     print("Patching RoPE for ONNX export (complex -> real arithmetic) ...")
@@ -254,6 +296,64 @@ def export_onnx(
         pass
 
 
+def export_trunk_onnx(
+    checkpoint_path: str,
+    output_path: str,
+    opset_version: int = 17,
+    use_dynamo: bool = False,
+):
+    """Export just the ViT trunk (no FPN neck) to ONNX.
+
+    Produces a single output tensor — the raw ViT feature map.  Used by the
+    native video tracker where both SAM3 and SAM2 FPN branches share the
+    same trunk output.
+    """
+    from sam3.model_builder import build_sam3_image_model
+    from sam3.trt.rope_onnx import patch_rope_for_export, patch_sdpa_for_export
+
+    print(f"Loading SAM3 model from {checkpoint_path} ...")
+    model = build_sam3_image_model(
+        checkpoint_path=checkpoint_path,
+        device="cuda",
+        eval_mode=True,
+        load_from_HF=False,
+        enable_segmentation=False,
+    )
+    backbone = model.backbone
+
+    print("Patching RoPE for ONNX export ...")
+    patch_rope_for_export(backbone)
+    print("Patching SDPA for ONNX export ...")
+    patch_sdpa_for_export(backbone)
+
+    export_module = _TrunkForExport(backbone).cuda().eval()
+    dummy = torch.randn(1, 3, 1008, 1008, device="cuda")
+
+    output_names = ["trunk_out"]
+
+    if use_dynamo and opset_version < 18:
+        opset_version = 18
+
+    if use_dynamo:
+        _export_dynamo(export_module, dummy, output_path, opset_version, output_names)
+    else:
+        _export_torchscript(export_module, dummy, output_path, opset_version, output_names)
+
+    size_mb = Path(output_path).stat().st_size / (1024 * 1024)
+    print(f"Done. Trunk ONNX saved: {output_path} ({size_mb:.1f} MB)")
+
+    # Validate
+    try:
+        import onnx
+        onnx_model = onnx.load(output_path)
+        onnx.checker.check_model(onnx_model)
+        print("ONNX model validation passed.")
+    except ImportError:
+        pass
+    except Exception as e:
+        print(f"ONNX validation warning: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Export SAM3 backbone to ONNX")
     parser.add_argument(
@@ -276,15 +376,40 @@ def main():
         help="Use dynamo-based export (PyTorch 2.5+). Produces a different "
              "ONNX graph that may fix TRT FP16 numerical issues.",
     )
+    parser.add_argument(
+        "--trunk-only",
+        action="store_true",
+        help="Export only the ViT trunk (no FPN neck). Produces a single "
+             "output tensor. Used by the native video tracker.",
+    )
+    parser.add_argument(
+        "--skip-blocks", type=str, default=None,
+        help="Comma-separated block indices to skip entirely, e.g. '25,28,27'",
+    )
+    parser.add_argument(
+        "--pruned-checkpoint", type=str, default=None,
+        help="Path to pruned checkpoint from prune_trainer (.pt). "
+             "Loads fine-tuned weights and auto-applies skip_blocks.",
+    )
     args = parser.parse_args()
 
-    export_onnx(
-        checkpoint_path=args.checkpoint,
-        output_path=args.output,
-        opset_version=args.opset,
-        validate=not args.no_validate,
-        use_dynamo=args.dynamo,
-    )
+    if args.trunk_only:
+        export_trunk_onnx(
+            checkpoint_path=args.checkpoint,
+            output_path=args.output,
+            opset_version=args.opset,
+            use_dynamo=args.dynamo,
+        )
+    else:
+        export_onnx(
+            checkpoint_path=args.checkpoint,
+            output_path=args.output,
+            opset_version=args.opset,
+            validate=not args.no_validate,
+            use_dynamo=args.dynamo,
+            skip_blocks=args.skip_blocks,
+            pruned_checkpoint=args.pruned_checkpoint,
+        )
 
 
 if __name__ == "__main__":
