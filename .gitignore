@@ -1,3 +1,24 @@
+# ── DART project-specific ──────────────────────────────────
+# TensorRT engines (GPU-specific, must be rebuilt per machine)
+*.engine
+
+# ONNX exports (large, reproducible from checkpoints)
+*.onnx
+*.onnx.data
+onnx_hf_backbone/
+
+# Model checkpoints (downloaded from HuggingFace)
+*.pt
+*.pth
+*.safetensors
+
+# Text caches
+text_cache_*.pt
+
+# Test/scratch images
+x.jpg
+
+# ── Python ─────────────────────────────────────────────────
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
